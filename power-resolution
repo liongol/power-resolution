@@ -1,0 +1,439 @@
+#!/usr/bin/python3
+import os
+import sys
+import json
+import subprocess
+import time
+import argparse
+import dbus
+
+CONFIG_DIR = os.path.expanduser("~/.config/power-resolution")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+SYSTEMD_USER_DIR = os.path.expanduser("~/.config/systemd/user")
+MONITOR_SERVICE_FILE = os.path.join(SYSTEMD_USER_DIR, "power-resolution-monitor.service")
+HELPER_SCRIPT_PATH = os.path.expanduser("~/.local/bin/wayland-power-resolution.sh")
+
+VERBOSE = False
+
+def log(msg):
+    if VERBOSE:
+        print(f"[DEBUG] {msg}", file=sys.stderr)
+
+def check_dependencies():
+    log("Checking environment and dependencies...")
+    if os.environ.get("XDG_SESSION_TYPE") != "wayland":
+        print("Warning: XDG_SESSION_TYPE is not 'wayland'. GNOME Mutter D-Bus integration requires a Wayland session.", file=sys.stderr)
+    
+    try:
+        bus = dbus.SessionBus()
+        obj = bus.get_object("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig")
+        iface = dbus.Interface(obj, "org.gnome.Mutter.DisplayConfig")
+        log("Successfully connected to org.gnome.Mutter.DisplayConfig")
+        return iface
+    except Exception as e:
+        print(f"Error: Could not connect to GNOME Mutter DisplayConfig via D-Bus: {e}", file=sys.stderr)
+        print("Ensure you are running inside a GNOME Wayland session and 'python3-dbus' is installed.", file=sys.stderr)
+        sys.exit(1)
+
+def get_display_state(iface=None):
+    if iface is None:
+        iface = check_dependencies()
+    try:
+        return iface.GetCurrentState()
+    except Exception as e:
+        print(f"Error calling GetCurrentState(): {e}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_setup(args):
+    global VERBOSE
+    VERBOSE = args.verbose
+    print("=== Power Resolution Setup Wizard ===")
+    
+    iface = check_dependencies()
+    serial, monitors, logical_monitors, properties = get_display_state(iface)
+
+    target_monitor = None
+    monitor_data = None
+
+    for monitor in monitors:
+        monitor_spec, modes, monitor_props = monitor
+        connector = monitor_spec[0]
+        is_builtin = monitor_props.get("is-builtin", False)
+        display_name = monitor_props.get("display-name", "Unknown")
+        print(f"\nDetected display: {connector} ({display_name}, Built-in: {is_builtin})")
+        if is_builtin or target_monitor is None:
+            target_monitor = connector
+            monitor_data = monitor
+
+    if not target_monitor:
+        print("Error: No suitable display found.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"\nUsing target display: {target_monitor}")
+    _, modes, _ = monitor_data
+
+    print("\nAvailable display modes:")
+    mode_list = []
+    for idx, mode in enumerate(modes):
+        mode_id = mode[0]
+        width, height, rate = mode[1], mode[2], mode[3]
+        props = mode[6] if len(mode) > 6 else {}
+        preferred = props.get("is-preferred", False)
+        current = props.get("is-current", False)
+        pref_str = " (preferred)" if preferred else ""
+        curr_str = " (current)" if current else ""
+        print(f"  [{idx + 1}] {mode_id} ({width}x{height} @ {rate}Hz){pref_str}{curr_str}")
+        mode_list.append(mode_id)
+
+    def select_mode(prompt_text, default_idx=0):
+        while True:
+            choice = input(f"{prompt_text} [1-{len(mode_list)}] (default {default_idx+1}): ").strip()
+            if not choice:
+                return mode_list[default_idx]
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(mode_list):
+                    return mode_list[idx]
+            except ValueError:
+                pass
+            print("Invalid selection. Try again.")
+
+    print("\n--- AC Power (Plugged In) Configuration ---")
+    ac_mode = select_mode("Select AC resolution/mode", 0)
+    
+    ac_scales = []
+    for m in modes:
+        if m[0] == ac_mode:
+            ac_scales = m[5] # supported scales
+            break
+    if not ac_scales:
+        ac_scales = [1.0, 1.25, 1.5, 2.0]
+
+    def select_scale(scales, default_val=1.0):
+        unique_scales = sorted(list(set(round(float(s), 2) for s in scales)))
+        if not unique_scales:
+            unique_scales = [1.0, 1.25, 1.5, 2.0]
+
+        print("\nSupported scales:")
+        default_idx = 0
+        for idx, s in enumerate(unique_scales):
+            is_def = " (default)" if abs(s - default_val) < 0.01 else ""
+            if abs(s - default_val) < 0.01:
+                default_idx = idx
+            print(f"  [{idx + 1}] {s}{is_def}")
+
+        while True:
+            choice = input(f"Select scale [1-{len(unique_scales)}] (default {default_idx + 1}): ").strip()
+            if not choice:
+                return unique_scales[default_idx]
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(unique_scales):
+                    return unique_scales[idx]
+            except ValueError:
+                pass
+            print("Invalid selection. Try again.")
+
+        print("\n--- AC Power (Plugged In) Scale ---")
+    ac_scale = select_scale(ac_scales, 2.0 if "3200" in ac_mode else 1.0)
+
+    print("\n--- Battery Power (Unplugged) Configuration ---")
+    battery_mode = select_mode("Select Battery resolution/mode", min(1, len(mode_list)-1))
+    
+    battery_scales = []
+    for m in modes:
+        if m[0] == battery_mode:
+            battery_scales = m[5]
+            break
+    if not battery_scales:
+        battery_scales = [1.0, 1.25, 1.5, 2.0]
+
+    print("\n--- Battery Power (Unplugged) Scale ---")
+    battery_scale = select_scale(battery_scales, 1.25 if "1920" in battery_mode else 1.0)
+
+    config = {
+        "monitor": target_monitor,
+        "ac_mode": ac_mode,
+        "ac_scale": ac_scale,
+        "battery_mode": battery_mode,
+        "battery_scale": battery_scale
+    }
+
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"\n✓ Configuration saved to {CONFIG_FILE}")
+
+    # Generate robust helper script
+    os.makedirs(os.path.dirname(HELPER_SCRIPT_PATH), exist_ok=True)
+    
+    helper_code = f"""#!/usr/bin/python3
+import sys
+import os
+import dbus
+import glob
+
+MONITOR = "{target_monitor}"
+AC_MODE = "{ac_mode}"
+AC_SCALE = {ac_scale}
+BATTERY_MODE = "{battery_mode}"
+BATTERY_SCALE = {battery_scale}
+VERBOSE = {str(VERBOSE)}
+
+def log(msg):
+    if VERBOSE:
+        print(f"[HELPER DEBUG] {{msg}}", file=sys.stderr)
+
+def get_ac_state():
+    # 1. Check AC online files
+    for path in ["/sys/class/power_supply/AC/online", "/sys/class/power_supply/ACAD/online", "/sys/class/power_supply/ADP1/online"]:
+        try:
+            with open(path, "r") as f:
+                val = f.read().strip()
+                log(f"Checked {{path}}: {{val}}")
+                if val in ["0", "1"]:
+                    return val == "1"
+        except FileNotFoundError:
+            continue
+    for path in glob.glob("/sys/class/power_supply/AC*/online") + glob.glob("/sys/class/power_supply/ADP*/online"):
+        try:
+            with open(path, "r") as f:
+                val = f.read().strip()
+                log(f"Checked glob {{path}}: {{val}}")
+                if val == "1":
+                    return True
+                elif val == "0":
+                    return False
+        except Exception:
+            continue
+
+    # 2. Fallback: check battery status
+    for path in glob.glob("/sys/class/power_supply/BAT*/status"):
+        try:
+            with open(path, "r") as f:
+                status = f.read().strip().lower()
+                log(f"Checked battery status {{path}}: {{status}}")
+                if status == "discharging":
+                    return False
+                elif status in ["charging", "full"]:
+                    return True
+        except Exception:
+            continue
+
+    log("Could not determine power state reliably, defaulting to AC (True)")
+    return True
+
+try:
+    is_ac = get_ac_state()
+    target_mode = AC_MODE if is_ac else BATTERY_MODE
+    target_scale = AC_SCALE if is_ac else BATTERY_SCALE
+
+    print(f"{{'AC' if is_ac else 'Battery'}} power detected. Applying {{MONITOR}} -> {{target_mode}} @ scale {{target_scale}}")
+
+    bus = dbus.SessionBus()
+    obj = bus.get_object("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig")
+    iface = dbus.Interface(obj, "org.gnome.Mutter.DisplayConfig")
+
+    serial, monitors, logical_monitors, properties = iface.GetCurrentState()
+
+    new_logical_monitors = []
+    for lm in logical_monitors:
+        x, y, current_scale, transform, primary, monitor_infos, lm_properties = lm
+        new_monitors = []
+        for monitor_info in monitor_infos:
+            connector = monitor_info[0]
+            if connector == MONITOR:
+                new_monitors.append((connector, target_mode, {{}}))
+            else:
+                new_monitors.append((connector, monitor_info[1], {{}}))
+        
+        new_scale = current_scale
+        for monitor_info in monitor_infos:
+            if monitor_info[0] == MONITOR:
+                new_scale = target_scale
+
+        new_logical_monitors.append((x, y, new_scale, transform, primary, new_monitors))
+
+    iface.ApplyMonitorsConfig(dbus.UInt32(serial), dbus.UInt32(2), new_logical_monitors, {{}})
+    print("Display configuration applied successfully.")
+except Exception as e:
+    print(f"Error in power resolution helper: {{e}}", file=sys.stderr)
+    sys.exit(1)
+"""
+
+    with open(HELPER_SCRIPT_PATH, "w") as f:
+        f.write(helper_code)
+    os.chmod(HELPER_SCRIPT_PATH, 0o755)
+    print(f"✓ Helper script written to {HELPER_SCRIPT_PATH}")
+
+    # Setup systemd user service & monitor
+    os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
+    
+    monitor_service_content = f"""[Unit]
+Description=Monitor AC power and change display configuration
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c 'LAST=""; while true; do STATE=$(cat /sys/class/power_supply/AC*/online 2>/dev/null | head -n1); if [ "$STATE" != "$LAST" ]; then {HELPER_SCRIPT_PATH}; LAST="$STATE"; fi; sleep 3; done'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+"""
+
+    with open(MONITOR_SERVICE_FILE, "w") as f:
+        f.write(monitor_service_content)
+    print(f"✓ Systemd monitor service written to {MONITOR_SERVICE_FILE}")
+
+    # Check systemd user daemon
+    try:
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        subprocess.run(["systemctl", "--user", "enable", "--now", "power-resolution-monitor.service"], check=True)
+        print("✓ Systemd service enabled and started.")
+    except Exception as e:
+        print(f"Warning: Could not automatically enable systemd service: {e}", file=sys.stderr)
+        print("You can manually enable it later with: systemctl --user enable --now power-resolution-monitor.service", file=sys.stderr)
+
+    # Apply immediately
+    print("\nApplying current configuration...")
+    subprocess.run([HELPER_SCRIPT_PATH])
+    print("\nSetup completed successfully!")
+
+def cmd_apply(args):
+    global VERBOSE
+    VERBOSE = args.verbose
+    if not os.path.exists(HELPER_SCRIPT_PATH):
+        print(f"Error: Helper script not found at {HELPER_SCRIPT_PATH}. Run 'power-resolution setup' first.", file=sys.stderr)
+        sys.exit(1)
+    os.execv(HELPER_SCRIPT_PATH, [HELPER_SCRIPT_PATH])
+
+def cmd_status(args):
+    global VERBOSE
+    VERBOSE = args.verbose
+    if not os.path.exists(CONFIG_FILE):
+        print("Not configured. Run 'power-resolution setup' first.")
+        return
+    with open(CONFIG_FILE, "r") as f:
+        config = json.load(f)
+    print("=== Power Resolution Status ===")
+    print(json.dumps(config, indent=2))
+    print("\nSystemd Service Status:")
+    try:
+        subprocess.run(["systemctl", "--user", "status", "power-resolution-monitor.service"])
+    except Exception as e:
+        print(f"Could not query systemd status: {e}")
+
+def cmd_config(args):
+    global VERBOSE
+    VERBOSE = args.verbose
+    if not os.path.exists(CONFIG_FILE):
+        print("Not configured. Run 'power-resolution setup' first.")
+        return
+    
+    with open(CONFIG_FILE, "r") as f:
+        config = json.load(f)
+
+    if args.set_ac_mode:
+        config["ac_mode"] = args.set_ac_mode
+    if args.set_ac_scale:
+        config["ac_scale"] = float(args.set_ac_scale)
+    if args.set_battery_mode:
+        config["battery_mode"] = args.set_battery_mode
+    if args.set_battery_scale:
+        config["battery_scale"] = float(args.set_battery_scale)
+
+    if args.set_ac_mode or args.set_ac_scale or args.set_battery_mode or args.set_battery_scale:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config, f, indent=2)
+        print("✓ Configuration updated.")
+        # Re-run setup generation or regenerate helper script with new config
+        print("Please re-run 'power-resolution setup' or re-apply to regenerate helper script with new values.")
+    else:
+        print(json.dumps(config, indent=2))
+
+def cmd_enable(args):
+    try:
+        subprocess.run(["systemctl", "--user", "enable", "--now", "power-resolution-monitor.service"], check=True)
+        print("Service enabled and started.")
+    except Exception as e:
+        print(f"Error enabling service: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_disable(args):
+    try:
+        subprocess.run(["systemctl", "--user", "disable", "--now", "power-resolution-monitor.service"], check=True)
+        print("Service disabled and stopped.")
+    except Exception as e:
+        print(f"Error disabling service: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_uninstall(args):
+    print("Uninstalling power-resolution...")
+    try:
+        subprocess.run(["systemctl", "--user", "disable", "--now", "power-resolution-monitor.service"], stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    for path in [MONITOR_SERVICE_FILE, HELPER_SCRIPT_PATH, CONFIG_FILE]:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                print(f"Removed {path}")
+            except Exception as e:
+                print(f"Could not remove {path}: {e}")
+    try:
+        subprocess.run(["systemctl", "--user", "daemon-reload"], stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    print("Uninstall complete.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Power-based display resolution and scaling manager for GNOME Wayland")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging")
+    
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # setup
+    p_setup = subparsers.add_parser("setup", help="Run interactive setup wizard")
+    p_setup.set_defaults(func=cmd_setup)
+
+    # apply
+    p_apply = subparsers.add_parser("apply", help="Apply resolution/scale based on current power state")
+    p_apply.set_defaults(func=cmd_apply)
+
+    # status
+    p_status = subparsers.add_parser("status", help="Show current configuration and service status")
+    p_status.set_defaults(func=cmd_status)
+
+    # config
+    p_config = subparsers.add_parser("config", help="View or update configuration settings")
+    p_config.add_argument("--set-ac-mode", help="Set AC resolution mode")
+    p_config.add_argument("--set-ac-scale", help="Set AC scale factor")
+    p_config.add_argument("--set-battery-mode", help="Set Battery resolution mode")
+    p_config.add_argument("--set-battery-scale", help="Set Battery scale factor")
+    p_config.set_defaults(func=cmd_config)
+
+    # enable
+    p_enable = subparsers.add_parser("enable", help="Enable automatic power monitoring service")
+    p_enable.set_defaults(func=cmd_enable)
+
+    # disable
+    p_disable = subparsers.add_parser("disable", help="Disable automatic power monitoring service")
+    p_disable.set_defaults(func=cmd_disable)
+
+    # uninstall
+    p_uninstall = subparsers.add_parser("uninstall", help="Remove configuration, scripts, and services")
+    p_uninstall.set_defaults(func=cmd_uninstall)
+
+    args = parser.parse_args()
+
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user.", file=sys.stderr)
+        sys.exit(130)
+
+if __name__ == "__main__":
+    main()
